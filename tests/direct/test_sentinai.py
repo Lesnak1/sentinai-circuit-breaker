@@ -9,7 +9,7 @@ def test_critical_threat_adjudication_and_circuit_breaker(
     Test complete lifecycle of SentinAI:
     1. Alice registers a DeFi vault (0xVault...) with 40 GEN bounty pool.
     2. Bob (Whitehat) detects active exploit and submits a threat report with 1 GEN stake.
-    3. GenLayer validators fetch live exploit evidence, reach consensus on CRITICAL threat (conf: 96),
+    3. GenLayer validators fetch live exploit evidence, reach consensus on CRITICAL threat (conf: 96, action: EMERGENCY_PAUSE),
        trigger the emergency pause circuit-breaker, and award 10 GEN bounty (25% pool) + 1 GEN stake refund to Bob.
     """
     contract = direct_deploy("contracts/sentinai.py")
@@ -40,13 +40,13 @@ def test_critical_threat_adjudication_and_circuit_breaker(
         },
     )
 
-    # Mock LLM threat classification
+    # Mock LLM threat classification with canonical action decision
     direct_vm.mock_llm(
         r".*SentinAI Web3 Threat Oracle.*",
         json.dumps({
             "threat_level": "CRITICAL",
             "confidence_score": 96,
-            "should_pause": True,
+            "action_decision": "EMERGENCY_PAUSE",
             "rationale": "Active reentrancy vulnerability confirmed against target vault contract. Immediate circuit-breaker pause required.",
         }),
     )
@@ -72,6 +72,7 @@ def test_critical_threat_adjudication_and_circuit_breaker(
     rep = contract.get_threat_report(rep_id)
     assert rep["threat_level"] == "CRITICAL"
     assert rep["confidence_score"] == 96
+    assert rep["action_decision"] == "EMERGENCY_PAUSE"
     assert rep["adjudicated"] is True
     # Award = 10 GEN bounty + 1 GEN stake refund = 11 GEN
     assert rep["bounty_awarded"] == str(11 * 10**18)
@@ -95,7 +96,7 @@ def test_false_positive_stake_slashing(
         json.dumps({
             "threat_level": "FALSE_POSITIVE",
             "confidence_score": 15,
-            "should_pause": False,
+            "action_decision": "DISMISS_SPAM",
             "rationale": "No exploit signature or vulnerability detected. Normal user interaction.",
         }),
     )
@@ -116,6 +117,7 @@ def test_false_positive_stake_slashing(
 
     rep = contract.get_threat_report(rep_id)
     assert rep["threat_level"] == "FALSE_POSITIVE"
+    assert rep["action_decision"] == "DISMISS_SPAM"
     assert rep["bounty_awarded"] == "0"
 
 
@@ -137,7 +139,7 @@ def test_unauthorized_resume_protection(
         json.dumps({
             "threat_level": "CRITICAL",
             "confidence_score": 95,
-            "should_pause": True,
+            "action_decision": "EMERGENCY_PAUSE",
             "rationale": "Critical exploit.",
         }),
     )

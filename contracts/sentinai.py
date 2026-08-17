@@ -7,11 +7,26 @@ circuit-breaker protections. Threat advisories are independently verified by Gen
 validators via live web intelligence (CertiK, PeckShield, GitHub Security Advisories).
 When a critical exploit is verified, SentinAI deterministically pauses the target protocol
 and distributes a bounty to the whitehat reporter.
+
+Key Solvency & Consensus Guarantees:
+- Canonical Threshold Decision: Threat evaluation binds strictly to canonical action decisions:
+  * "EMERGENCY_PAUSE": Verified Critical/High exploit (confidence >= 80) -> triggers pause() and whitehat bounty
+  * "DISMISS_SPAM": Confirmed false positive / spam -> slashes anti-spam stake
+  * "INCONCLUSIVE_REFUND": Sub-threshold or non-critical threat -> refunds reporter stake
+- Non-Crossing Boundary Enforcement: Validators strictly reject any result where leader and validator
+  fall on opposite sides of the threshold (e.g. 79 vs 85 is strictly rejected).
+- Full Deterministic Finality on cross-contract pause and bounty disbursements.
 """
 
 from genlayer import *
 from dataclasses import dataclass
 import json
+
+
+# Canonical threshold constant
+EMERGENCY_CONFIDENCE_THRESHOLD = 80
+VALID_ACTION_DECISIONS = ["EMERGENCY_PAUSE", "DISMISS_SPAM", "INCONCLUSIVE_REFUND"]
+VALID_THREAT_LEVELS = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "FALSE_POSITIVE"]
 
 
 @allow_storage
@@ -33,6 +48,7 @@ class ThreatReport:
     evidence_url: str
     threat_level: str  # "CRITICAL", "HIGH", "MEDIUM", "LOW", "FALSE_POSITIVE"
     confidence_score: u32  # 0 - 100
+    action_decision: str  # "EMERGENCY_PAUSE", "DISMISS_SPAM", "INCONCLUSIVE_REFUND"
     adjudicated: bool
     bounty_awarded: u256
     summary: str
@@ -50,7 +66,7 @@ class IPausableVault:
 
 
 class SentinAI(gl.Contract):
-    """Autonomous Threat Oracle and Security Circuit Breaker for GenLayer."""
+    """Autonomous Threat Oracle and Security Circuit Breaker for GenLayer with Bound Thresholds."""
 
     vaults: TreeMap[Address, ProtectedVault]
     reports: TreeMap[u256, ThreatReport]
@@ -89,7 +105,7 @@ class SentinAI(gl.Contract):
     ) -> u256:
         """
         Security researcher submits an urgent threat report with live web evidence.
-        Requires 1 GEN anti-spam stake. Triggers multi-validator neural consensus.
+        Requires 1 GEN anti-spam stake. Triggers multi-validator neural consensus with bound threshold decisions.
         """
         stake = gl.message.value
         if stake < self.min_report_stake:
@@ -138,15 +154,18 @@ class SentinAI(gl.Contract):
                - "HIGH": Severe unexploited vulnerability with valid PoC.
                - "MEDIUM" / "LOW": Minor griefing or theoretical non-loss issues.
                - "FALSE_POSITIVE": Irrelevant, spam, or invalid evidence.
-            2. "confidence_score": Integer 0 to 100 representing certainty.
-            3. "should_pause": Boolean true ONLY if threat_level in ["CRITICAL", "HIGH"] and confidence_score >= 80.
+            2. "confidence_score": Integer 0 to 100 representing evidentiary certainty.
+            3. "action_decision": Canonical decision, must be exactly one of:
+               - "EMERGENCY_PAUSE": Set ONLY if threat_level in ["CRITICAL", "HIGH"] AND confidence_score >= 80.
+               - "DISMISS_SPAM": Set if threat_level == "FALSE_POSITIVE".
+               - "INCONCLUSIVE_REFUND": Set for all other non-critical or sub-threshold cases (confidence < 80).
             4. "rationale": 1-2 sentence technical assessment.
 
             Respond ONLY with a valid JSON object matching this schema:
             {{
                 "threat_level": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"FALSE_POSITIVE",
                 "confidence_score": int,
-                "should_pause": bool,
+                "action_decision": "EMERGENCY_PAUSE"|"DISMISS_SPAM"|"INCONCLUSIVE_REFUND",
                 "rationale": "string"
             }}
             """
@@ -164,24 +183,42 @@ class SentinAI(gl.Contract):
             if not isinstance(lead, dict):
                 return False
 
-            for k in ["threat_level", "confidence_score", "should_pause", "rationale"]:
+            for k in ["threat_level", "confidence_score", "action_decision", "rationale"]:
                 if k not in lead:
                     return False
 
+            lead_level = str(lead.get("threat_level", ""))
+            lead_action = str(lead.get("action_decision", ""))
+            lead_conf = int(lead.get("confidence_score", 0))
+
+            if lead_level not in VALID_THREAT_LEVELS or lead_action not in VALID_ACTION_DECISIONS:
+                return False
+
+            # Consistency check: EMERGENCY_PAUSE requires confidence >= 80 and level in CRITICAL/HIGH
+            if lead_action == "EMERGENCY_PAUSE" and (lead_conf < EMERGENCY_CONFIDENCE_THRESHOLD or lead_level not in ["CRITICAL", "HIGH"]):
+                return False
+
             val = leader_fn()
+            val_level = str(val.get("threat_level", ""))
+            val_action = str(val.get("action_decision", ""))
+            val_conf = int(val.get("confidence_score", 0))
 
-            # Threat level classification must match exactly
-            if lead.get("threat_level") != val.get("threat_level"):
+            # 1. Threat level classification must match
+            if lead_level != val_level:
                 return False
 
-            # Emergency action verdict must agree
-            if bool(lead.get("should_pause")) != bool(val.get("should_pause")):
+            # 2. Canonical action decision must match exactly
+            if lead_action != val_action:
                 return False
 
-            # Confidence score tolerance within ±6 points
-            l_conf = int(lead.get("confidence_score", 0))
-            v_conf = int(val.get("confidence_score", 0))
-            if abs(l_conf - v_conf) > 6:
+            # 3. Strict Boundary Binding: Leader and validator CANNOT cross the 80% threshold
+            lead_crosses = lead_conf >= EMERGENCY_CONFIDENCE_THRESHOLD
+            val_crosses = val_conf >= EMERGENCY_CONFIDENCE_THRESHOLD
+            if lead_crosses != val_crosses:
+                return False
+
+            # 4. Within the same threshold bucket, tolerance is within ±6 points
+            if abs(lead_conf - val_conf) > 6:
                 return False
 
             return True
@@ -191,13 +228,13 @@ class SentinAI(gl.Contract):
 
         level = str(verdict.get("threat_level", "FALSE_POSITIVE"))
         conf = u32(int(verdict.get("confidence_score", 0)))
-        should_pause = bool(verdict.get("should_pause", False))
+        action = str(verdict.get("action_decision", "INCONCLUSIVE_REFUND"))
         rationale = str(verdict.get("rationale", ""))
 
         bounty_payout = u256(0)
 
-        # Deterministic Financial & Circuit-Breaker Gate
-        if should_pause and (level == "CRITICAL" or level == "HIGH") and conf >= u32(80):
+        # Deterministic Financial & Circuit-Breaker Gate bound to Canonical Decision
+        if action == "EMERGENCY_PAUSE" and (level == "CRITICAL" or level == "HIGH") and conf >= u32(EMERGENCY_CONFIDENCE_THRESHOLD):
             vault.is_paused = True
             vault.last_threat_level = level
 
@@ -223,12 +260,12 @@ class SentinAI(gl.Contract):
 
             _Recipient(reporter_addr).emit_transfer(value=bounty_payout)
 
-        elif level == "FALSE_POSITIVE":
+        elif action == "DISMISS_SPAM" or level == "FALSE_POSITIVE":
             # Slash anti-spam stake into vault's bounty pool to deter spam
             vault.bounty_pool = vault.bounty_pool + stake
             bounty_payout = u256(0)
         else:
-            # Non-critical but valid: refund stake
+            # Non-critical / inconclusive: refund stake
             @gl.evm.contract_interface
             class _Recipient:
                 class View:
@@ -247,6 +284,7 @@ class SentinAI(gl.Contract):
             evidence_url=evidence_url,
             threat_level=level,
             confidence_score=conf,
+            action_decision=action,
             adjudicated=True,
             bounty_awarded=bounty_payout,
             summary=rationale,
@@ -302,6 +340,7 @@ class SentinAI(gl.Contract):
             "evidence_url": rep.evidence_url,
             "threat_level": rep.threat_level,
             "confidence_score": int(rep.confidence_score),
+            "action_decision": rep.action_decision,
             "adjudicated": rep.adjudicated,
             "bounty_awarded": str(rep.bounty_awarded),
             "summary": rep.summary,

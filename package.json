@@ -10,7 +10,7 @@
     "deploy": "genlayer deploy contracts/sentinai.py"
   },
   "dependencies": {
-    "genlayer-js": "^0.2.7"
+    "genlayer-js": "^1.1.8"
   },
   "devDependencies": {
     "typescript": "^5.3.3"
